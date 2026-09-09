@@ -57,7 +57,7 @@ class WineAnalysis(BaseModel):
 # 2. GEMINI API LAYER
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 BASE_SYSTEM_INSTRUCTION = (
     "Είσαι ένας κορυφαίος Sommelier. Ανάλυσε το κρασί που ζητάει ο χρήστης "
