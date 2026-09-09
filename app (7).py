@@ -1,0 +1,829 @@
+"""
+AI Sommelier Assistant
+-----------------------
+Streamlit web app για υπαλλήλους εστιατορίου/κάβας.
+Εισάγεις το όνομα ενός κρασιού και παίρνεις δομημένη ανάλυση:
+τύπο, ποικιλία, προέλευση, γευστικά χαρακτηριστικά, ταιριάσματα
+με φαγητό και εναλλακτικές προτάσεις.
+
+Αυτή η έκδοση συνδέεται με το Google Gemini API (google-genai SDK,
+μοντέλο gemini-2.5-flash) και ζητά structured JSON output που
+αντιστοιχεί απευθείας στο Pydantic schema `WineAnalysis`.
+"""
+
+import os
+import time
+from typing import List, Optional
+
+import pandas as pd
+import streamlit as st
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+
+
+# ---------------------------------------------------------------------------
+# 1. PYDANTIC MODELS — Structured Output Schema
+# ---------------------------------------------------------------------------
+
+class Recommendation(BaseModel):
+    """Μία εναλλακτική πρόταση φιάλης."""
+    name: str = Field(..., description="Όνομα προτεινόμενης φιάλης")
+    reasoning: str = Field(..., description="Γιατί προτείνεται αυτή η εναλλακτική")
+    profile: str = Field(..., description="Σύντομο γευστικό προφίλ της εναλλακτικής")
+
+
+class WineAnalysis(BaseModel):
+    """Πλήρης δομημένη ανάλυση ενός κρασιού."""
+    requested_wine: str = Field(..., description="Το όνομα του κρασιού που ζητήθηκε")
+    wine_type: str = Field(..., description="Τύπος κρασιού: Λευκό, Κόκκινο, Ροζέ, Αφρώδες κ.λπ.")
+    variety: str = Field(..., description="Ποικιλία / ποικιλίες σταφυλιού")
+    origin: str = Field(..., description="Περιοχή και χώρα προέλευσης")
+    characteristics: List[str] = Field(
+        default_factory=list,
+        description="Γευστικά χαρακτηριστικά: σώμα, οξύτητα, τανίνες, αρωματικές νότες",
+    )
+    food_pairing: List[str] = Field(
+        default_factory=list,
+        description="Προτεινόμενα ταιριάσματα με φαγητό",
+    )
+    recommendations: List[Recommendation] = Field(
+        default_factory=list,
+        description=(
+            "Ακριβώς 4 εναλλακτικές προτάσεις φιάλης, εκ των οποίων "
+            "τουλάχιστον μία ελληνικό κρασί αντίστοιχου προφίλ, όποτε αυτό "
+            "είναι εφικτό"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. GEMINI API LAYER
+# ---------------------------------------------------------------------------
+
+MODEL_NAME = "gemini-3.6-flash"
+
+# Πόσες φορές ξαναδοκιμάζουμε αυτόματα όταν το Gemini επιστρέφει
+# προσωρινό σφάλμα υπερφόρτωσης (503 UNAVAILABLE), και πόσο περιμένουμε
+# ανάμεσα σε κάθε προσπάθεια (σε δευτερόλεπτα, αυξανόμενο κάθε φορά).
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = [2, 5, 10]
+
+BASE_SYSTEM_INSTRUCTION = (
+    "Είσαι ένας κορυφαίος Sommelier. Ανάλυσε το κρασί που ζητάει ο χρήστης "
+    "και πρότεινε ΑΚΡΙΒΩΣ 4 εναλλακτικές φιάλες με παρόμοιο γευστικό προφίλ "
+    "ή ποικιλία. Ανάμεσα στις 4 προτάσεις, συμπεριέλαβε ΤΟΥΛΑΧΙΣΤΟΝ ΕΝΑ "
+    "ελληνικό κρασί αντίστοιχου γευστικού προφίλ, όποτε αυτό είναι εφικτό. "
+    "Όλες οι απαντήσεις πρέπει να είναι στα Ελληνικά."
+)
+
+# Προεπιλεγμένη (demo) λίστα κρασιών καταστήματος — χρησιμοποιείται όταν
+# ο χρήστης ενεργοποιήσει το toggle "Χρήση προεπιλεγμένης λίστας" χωρίς
+# να ανεβάσει δικό του αρχείο.
+DEFAULT_WINE_LIST: List[str] = [
+    "Κτήμα Γεροβασιλείου Ξινόμαυρο",
+    "Κτήμα Καρυδά Ξινόμαυρο",
+    "Αγιωργίτικο Νεμέα, Παπαϊωάννου",
+    "Ασύρτικο Σαντορίνης, Sigalas",
+    "Μοσχοφίλερο, Τσέλεπος",
+    "Μαλαγουζιά, Κτήμα Βιβλία Χώρα",
+    "Cabernet Sauvignon, Κτήμα Λαζαρίδη",
+    "Merlot, Κτήμα Στροφιλιά",
+    "Νεμέα Ροζέ, Domaine Skouras",
+    "Αφρώδες Ξινόμαυρο Brut, Κτήμα Ράψανη",
+]
+
+
+def build_system_instruction(wine_list: Optional[List[str]]) -> str:
+    """
+    Χτίζει το τελικό System Instruction ανάλογα με το ενεργό Mode:
+
+    MODE A (wine_list μη κενή): οι αντιπροτάσεις πρέπει να προέρχονται
+    ΑΠΟΚΛΕΙΣΤΙΚΑ από τη διαθέσιμη λίστα του μαγαζιού.
+
+    MODE B (χωρίς λίστα): ελεύθερη αναζήτηση στον παγκόσμιο αμπελώνα.
+    """
+    if wine_list:
+        list_str = ", ".join(wine_list)
+        mode_instruction = (
+            "Επέλεξε τις αντιπροτάσεις ΑΠΟΚΛΕΙΣΤΙΚΑ από την παρακάτω "
+            f"διαθέσιμη λίστα κρασιών του μαγαζιού: [{list_str}]. "
+            "Μην προτείνεις καμία φιάλη που δεν περιλαμβάνεται σε αυτή τη "
+            "λίστα, ακόμα κι αν υπάρχει καλύτερη επιλογή αλλού. Αν η λίστα "
+            "περιέχει ελληνικά κρασιά αντίστοιχου προφίλ, δώσε προτεραιότητα "
+            "σε τουλάχιστον ένα από αυτά."
+        )
+    else:
+        mode_instruction = (
+            "Πρότεινε τις καλύτερες εναλλακτικές φιάλες από τον παγκόσμιο "
+            "αμπελώνα με βάση το γευστικό προφίλ."
+        )
+    return f"{BASE_SYSTEM_INSTRUCTION}\n\n{mode_instruction}"
+
+
+def parse_wine_list_file(uploaded_file) -> List[str]:
+    """
+    Διαβάζει ένα ανεβασμένο CSV ή Excel αρχείο και επιστρέφει μια επίπεδη
+    λίστα με ονόματα κρασιών (strings).
+
+    Αναζητά στήλη με προφανές όνομα (wine/name/κρασί/όνομα/label) και,
+    αν δεν βρεθεί, χρησιμοποιεί την πρώτη στήλη του αρχείου.
+    Ρίχνει ValueError με κατανοητό μήνυμα αν κάτι πάει στραβά.
+    """
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif filename.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded_file)
+    else:
+        raise ValueError(
+            "Μη υποστηριζόμενος τύπος αρχείου. Χρησιμοποίησε .csv, .xlsx ή .xls."
+        )
+
+    if df.empty or len(df.columns) == 0:
+        raise ValueError("Το αρχείο δεν περιέχει δεδομένα.")
+
+    candidate_names = {"wine", "name", "wine_name", "κρασί", "κρασι", "όνομα", "ονομα", "label"}
+    candidate_cols = [c for c in df.columns if str(c).strip().lower() in candidate_names]
+    target_col = candidate_cols[0] if candidate_cols else df.columns[0]
+
+    wines = (
+        df[target_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    wines = [w for w in wines.tolist() if w]
+
+    if not wines:
+        raise ValueError("Δεν εντοπίστηκαν ονόματα κρασιών στο αρχείο.")
+
+    return wines
+
+
+def get_api_key() -> str:
+    """
+    Επιστρέφει το Gemini API key.
+
+    Προτεραιότητα:
+    1. Environment variable GEMINI_API_KEY
+    2. Πεδίο εισαγωγής στο Sidebar (st.session_state["gemini_api_key"])
+    """
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    return st.session_state.get("gemini_api_key", "").strip()
+
+
+def get_wine_analysis(wine_name: str, wine_list: Optional[List[str]] = None) -> WineAnalysis:
+    """
+    Καλεί το Gemini API (gemini-3.6-flash) ζητώντας structured JSON output
+    που αντιστοιχεί στο WineAnalysis schema, και επιστρέφει το
+    αποτέλεσμα ως πλήρως τυποποιημένο Pydantic object.
+
+    Αν δοθεί `wine_list`, ενεργοποιείται το MODE A (αντιπροτάσεις
+    αποκλειστικά από τη λίστα)· διαφορετικά ενεργοποιείται το MODE B
+    (ελεύθερη αναζήτηση στον παγκόσμιο αμπελώνα).
+
+    Σε περίπτωση προσωρινού σφάλματος υπερφόρτωσης του μοντέλου
+    (503 UNAVAILABLE), ξαναδοκιμάζει αυτόματα έως MAX_RETRIES φορές με
+    αυξανόμενη αναμονή, πριν τελικά παραδεχτεί αποτυχία.
+
+    Ρίχνει εξαίρεση (RuntimeError / ValueError / APIError) αν κάτι πάει
+    στραβά — ο caller είναι υπεύθυνος για το try/except γύρω από το UI.
+    """
+    api_key = get_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Δεν βρέθηκε Gemini API Key. Όρισε το environment variable "
+            "GEMINI_API_KEY ή συμπλήρωσέ το στο πεδίο της Sidebar."
+        )
+
+    client = genai.Client(api_key=api_key)
+    system_instruction = build_system_instruction(wine_list)
+
+    last_error: Optional[APIError] = None
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=f"Ανάλυσε το εξής κρασί: {wine_name}",
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=WineAnalysis,
+                ),
+            )
+
+            # Το SDK παρέχει ήδη το parsed αντικείμενο όταν δίνεται response_schema.
+            parsed = getattr(response, "parsed", None)
+            if isinstance(parsed, WineAnalysis):
+                return parsed
+
+            # Fallback: αν το .parsed δεν είναι διαθέσιμο για κάποιο λόγο,
+            # κάνουμε validation πάνω στο raw JSON text.
+            if not response.text:
+                raise ValueError("Το μοντέλο επέστρεψε κενή απάντηση.")
+            return WineAnalysis.model_validate_json(response.text)
+
+        except APIError as e:
+            # Ξαναδοκιμάζουμε ΜΟΝΟ σε προσωρινή υπερφόρτωση (503).
+            # Οποιοδήποτε άλλο σφάλμα API (π.χ. λάθος μοντέλο, auth) δεν
+            # έχει νόημα να ξαναδοκιμαστεί — ανεβαίνει αμέσως.
+            status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            is_overloaded = status_code == 503 or "UNAVAILABLE" in str(e).upper()
+
+            if is_overloaded and attempt < MAX_RETRIES:
+                last_error = e
+                time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)])
+                continue
+            raise
+
+    # Δεν πρέπει να φτάσουμε ποτέ εδώ, αλλά προς ασφάλεια:
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Αποτυχία κλήσης Gemini API μετά από επαναλαμβανόμενες προσπάθειες.")
+
+
+# ---------------------------------------------------------------------------
+# 3. UI CONFIG & STYLING
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="AI Sommelier Assistant",
+    page_icon="🍷",
+    layout="centered",
+    initial_sidebar_state="expanded",
+)
+
+CUSTOM_CSS = """
+<style>
+    /* -------- Global light, modern palette (wine accent) -------- */
+    :root {
+        --wine-bg: #faf7f5;
+        --wine-bg-alt: #f3ecec;
+        --wine-panel: #ffffff;
+        --wine-panel-alt: #f7eef0;
+        --wine-border: #ece1e0;
+        --wine-accent: #a8324a;
+        --wine-accent-light: #c94a63;
+        --wine-gold: #a9762f;
+        --wine-text: #2b1f22;
+        --wine-text-dim: #7a6a6d;
+        --shadow-sm: 0 1px 2px rgba(43, 31, 34, 0.06);
+        --shadow-md: 0 4px 16px rgba(43, 31, 34, 0.08);
+    }
+
+    .stApp {
+        background: linear-gradient(180deg, var(--wine-bg) 0%, var(--wine-bg-alt) 100%);
+        color: var(--wine-text);
+    }
+
+    /* Hide default Streamlit chrome for a cleaner look, but KEEP the
+       sidebar toggle arrow visible/clickable (crucial on mobile — it's
+       the only way to open the sidebar and upload the wine list). */
+    #MainMenu, footer {visibility: hidden;}
+    header[data-testid="stHeader"] {
+        background: transparent;
+        box-shadow: none;
+    }
+
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 640px;
+    }
+
+    /* -------- Animations -------- */
+    @keyframes fadeInUp {
+        from { opacity: 0; transform: translateY(8px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes shimmer {
+        0% { background-position: -450px 0; }
+        100% { background-position: 450px 0; }
+    }
+
+    /* -------- Header -------- */
+    .sommelier-header {
+        text-align: center;
+        margin-bottom: 1.5rem;
+        animation: fadeInUp 0.4s ease both;
+    }
+    .sommelier-header h1 {
+        font-size: 1.9rem;
+        margin-bottom: 0.2rem;
+        color: var(--wine-text);
+    }
+    .sommelier-header p {
+        color: var(--wine-text-dim);
+        font-size: 0.95rem;
+        margin-top: 0;
+    }
+
+    /* -------- Input row -------- */
+    div[data-testid="stTextInput"] input {
+        background-color: var(--wine-panel);
+        color: var(--wine-text);
+        border: 1px solid var(--wine-border);
+        border-radius: 10px;
+        padding: 0.7rem 0.9rem;
+        box-shadow: var(--shadow-sm);
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    div[data-testid="stTextInput"] input:focus {
+        border-color: var(--wine-accent);
+        box-shadow: 0 0 0 3px rgba(168, 50, 74, 0.15);
+    }
+
+    .stButton > button, .stFormSubmitButton > button {
+        background: linear-gradient(135deg, var(--wine-accent) 0%, #7a2138 100%);
+        color: #fff;
+        border: none;
+        border-radius: 10px;
+        padding: 0.6rem 1.2rem;
+        font-weight: 600;
+        width: 100%;
+        box-shadow: var(--shadow-sm);
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .stButton > button:hover, .stFormSubmitButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 16px rgba(168, 50, 74, 0.3);
+        color: #fff;
+        border: none;
+    }
+    .stButton > button:active, .stFormSubmitButton > button:active {
+        transform: translateY(0);
+    }
+
+    /* -------- Result cards -------- */
+    .wine-card {
+        background: var(--wine-panel);
+        border: 1px solid var(--wine-border);
+        border-radius: 14px;
+        padding: 1.2rem 1.3rem;
+        margin-bottom: 1rem;
+        box-shadow: var(--shadow-sm);
+        animation: fadeInUp 0.35s ease both;
+        transition: box-shadow 0.2s ease;
+    }
+    .wine-card:hover {
+        box-shadow: var(--shadow-md);
+    }
+    .wine-card h3 {
+        margin-top: 0;
+        color: var(--wine-accent);
+        font-size: 1.05rem;
+        border-bottom: 1px solid var(--wine-border);
+        padding-bottom: 0.5rem;
+        margin-bottom: 0.7rem;
+    }
+    .wine-title {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--wine-text);
+        margin-bottom: 0.1rem;
+    }
+
+    hr {
+        border-color: var(--wine-border);
+    }
+
+    /* -------- Dynamic Mode indicator -------- */
+    .mode-badge-wrap {
+        display: flex;
+        justify-content: center;
+        margin-bottom: 1.2rem;
+        animation: fadeInUp 0.4s ease both;
+    }
+    .mode-badge {
+        border-radius: 999px;
+        padding: 0.4rem 1rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        border: 1px solid transparent;
+        box-shadow: var(--shadow-sm);
+    }
+    .mode-badge.mode-a {
+        background: rgba(45, 145, 90, 0.1);
+        border-color: rgba(45, 145, 90, 0.35);
+        color: #227a4f;
+    }
+    .mode-badge.mode-b {
+        background: rgba(50, 110, 180, 0.1);
+        border-color: rgba(50, 110, 180, 0.35);
+        color: #2a5fa0;
+    }
+
+    /* -------- st.metric — Τύπος / Ποικιλία / Περιοχή -------- */
+    div[data-testid="stMetric"] {
+        background: var(--wine-panel);
+        border: 1px solid var(--wine-border);
+        border-radius: 12px;
+        padding: 0.7rem 0.5rem;
+        text-align: center;
+        box-shadow: var(--shadow-sm);
+        animation: fadeInUp 0.35s ease both;
+    }
+    div[data-testid="stMetricLabel"] {
+        justify-content: center;
+        color: var(--wine-gold) !important;
+        font-size: 0.75rem !important;
+    }
+    div[data-testid="stMetricValue"] {
+        justify-content: center;
+        color: var(--wine-text) !important;
+        font-size: 1.05rem !important;
+        word-break: break-word;
+    }
+
+    /* -------- Characteristic pills -------- */
+    .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 0.3rem;
+    }
+    .pill {
+        background: var(--wine-panel-alt);
+        color: var(--wine-text);
+        border: 1px solid var(--wine-border);
+        border-radius: 999px;
+        padding: 0.35rem 0.85rem;
+        font-size: 0.85rem;
+        line-height: 1.2;
+    }
+    .pill.pill-taste {
+        border-color: rgba(169, 118, 47, 0.35);
+        color: var(--wine-gold);
+        background: rgba(169, 118, 47, 0.07);
+    }
+
+    /* -------- Recommendation cards -------- */
+    .rec-card {
+        background: var(--wine-panel);
+        border: 1px solid var(--wine-border);
+        border-left: 4px solid var(--wine-accent);
+        border-radius: 12px;
+        padding: 1rem 1.1rem;
+        margin-bottom: 0.9rem;
+        box-shadow: var(--shadow-sm);
+        animation: fadeInUp 0.4s ease both;
+        transition: box-shadow 0.2s ease, transform 0.2s ease;
+    }
+    .rec-card:hover {
+        box-shadow: var(--shadow-md);
+        transform: translateY(-1px);
+    }
+    .rec-card .rec-name {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: var(--wine-text);
+        margin-bottom: 0.3rem;
+    }
+    .rec-card .rec-profile-pill {
+        display: inline-block;
+        background: var(--wine-panel-alt);
+        color: var(--wine-gold);
+        border: 1px solid var(--wine-border);
+        border-radius: 999px;
+        padding: 0.2rem 0.7rem;
+        font-size: 0.78rem;
+        margin-bottom: 0.6rem;
+    }
+    .rec-why-box {
+        background: rgba(168, 50, 74, 0.06);
+        border: 1px solid rgba(168, 50, 74, 0.2);
+        border-radius: 8px;
+        padding: 0.55rem 0.7rem;
+    }
+    .rec-why-label {
+        color: var(--wine-accent);
+        font-weight: 700;
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        display: block;
+        margin-bottom: 0.2rem;
+    }
+    .rec-why-text {
+        color: var(--wine-text);
+        font-size: 0.95rem;
+        font-weight: 600;
+        line-height: 1.35;
+    }
+
+    /* -------- Reset / clear button (secondary) -------- */
+    button[kind="secondary"] {
+        background: var(--wine-panel) !important;
+        color: var(--wine-text-dim) !important;
+        border: 1px solid var(--wine-border) !important;
+        font-weight: 600;
+        box-shadow: none !important;
+    }
+    button[kind="secondary"]:hover {
+        border-color: var(--wine-gold) !important;
+        color: var(--wine-gold) !important;
+        transform: none !important;
+    }
+
+    /* -------- Skeleton loaders -------- */
+    .skeleton {
+        background: linear-gradient(90deg, #ece4e4 25%, #f6f0f0 37%, #ece4e4 63%);
+        background-size: 450px 100%;
+        animation: shimmer 1.3s ease infinite;
+        border-radius: 8px;
+    }
+    .skeleton-title {
+        height: 24px;
+        width: 55%;
+        margin: 0 auto 1rem auto;
+        border-radius: 6px;
+    }
+    .skeleton-metric {
+        height: 62px;
+        border-radius: 12px;
+    }
+    .skeleton-pill {
+        height: 26px;
+        width: 88px;
+        border-radius: 999px;
+        display: inline-block;
+        margin: 0.25rem;
+    }
+    .skeleton-card {
+        height: 96px;
+        border-radius: 12px;
+        margin-bottom: 0.9rem;
+    }
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# 3b. SIDEBAR — API KEY CONFIGURATION
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("### ⚙️ Ρυθμίσεις API")
+    env_key_present = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+    if env_key_present:
+        st.success("Το GEMINI_API_KEY βρέθηκε ως environment variable.")
+    else:
+        st.text_input(
+            "Gemini API Key",
+            type="password",
+            placeholder="Επικόλλησε εδώ το API key σου",
+            help=(
+                "Εναλλακτικά, όρισε το environment variable GEMINI_API_KEY "
+                "ώστε να μη χρειάζεται να το εισάγεις εδώ."
+            ),
+            key="gemini_api_key",
+        )
+        st.caption(
+            "Το key χρησιμοποιείται μόνο κατά τη διάρκεια αυτής της συνεδρίας "
+            "και δεν αποθηκεύεται μόνιμα."
+        )
+
+    st.markdown("---")
+    st.markdown("### 📋 Λίστα Κρασιών Καταστήματος")
+    st.caption(
+        "Ανέβασε τη λίστα κρασιών του μαγαζιού σου για να περιοριστούν οι "
+        "αντιπροτάσεις σε ό,τι έχεις πραγματικά διαθέσιμο."
+    )
+
+    uploaded_wine_file = st.file_uploader(
+        "Αρχείο CSV ή Excel",
+        type=["csv", "xlsx", "xls"],
+        help="Μία στήλη με τα ονόματα των κρασιών (π.χ. 'Όνομα' ή 'Wine').",
+    )
+
+    use_default_list = st.toggle(
+        "Χρήση προεπιλεγμένης demo λίστας",
+        value=False,
+        disabled=uploaded_wine_file is not None,
+        help="Ενεργοποίησέ το αν θέλεις να δοκιμάσεις το Mode A χωρίς να ανεβάσεις δικό σου αρχείο.",
+    )
+
+    store_wine_list: List[str] = []
+    list_parse_error: Optional[str] = None
+
+    if uploaded_wine_file is not None:
+        try:
+            store_wine_list = parse_wine_list_file(uploaded_wine_file)
+            st.success(f"Φορτώθηκαν {len(store_wine_list)} κρασιά από το αρχείο.")
+        except Exception as e:
+            list_parse_error = str(e)
+            st.error(f"⚠️ Πρόβλημα στο αρχείο: {list_parse_error}")
+    elif use_default_list:
+        store_wine_list = DEFAULT_WINE_LIST
+
+    if store_wine_list:
+        with st.expander(f"Δες τη λίστα ({len(store_wine_list)} κρασιά)"):
+            for w in store_wine_list:
+                st.markdown(f"- {w}")
+
+
+# ---------------------------------------------------------------------------
+# 4. HEADER
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <div class="sommelier-header">
+        <h1>🍷 AI Sommelier Assistant</h1>
+        <p>Γρήγορη ανάλυση κρασιού για την ομάδα σέρβις &amp; κάβας</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- Dynamic Mode indicator ---
+if store_wine_list:
+    mode_badge_html = (
+        '<div class="mode-badge-wrap">'
+        f'<span class="mode-badge mode-a">🟢 Αναζήτηση από Λίστα Καταστήματος ({len(store_wine_list)} κρασιά)</span>'
+        "</div>"
+    )
+else:
+    mode_badge_html = (
+        '<div class="mode-badge-wrap">'
+        '<span class="mode-badge mode-b">🌐 Ελεύθερη Αναζήτηση (Παγκόσμιος Αμπελώνας)</span>'
+        "</div>"
+    )
+st.markdown(mode_badge_html, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# 5. INPUT AREA
+# ---------------------------------------------------------------------------
+
+with st.form(key="wine_search_form", clear_on_submit=True):
+    col1, col2 = st.columns([4, 1.3])
+    with col1:
+        wine_name_input = st.text_input(
+            "Όνομα κρασιού",
+            placeholder="π.χ. Κτήμα Γεροβασιλείου Ξινόμαυρο 2021",
+            label_visibility="collapsed",
+        )
+    with col2:
+        search_clicked = st.form_submit_button("🔍 Αναζήτηση")
+
+if "last_analysis" in st.session_state:
+    if st.button("🧹 Καθαρισμός / Νέα Αναζήτηση", type="secondary", use_container_width=True):
+        st.session_state.pop("last_analysis", None)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 6. RESULTS RENDERING
+# ---------------------------------------------------------------------------
+
+def render_skeleton() -> None:
+    """
+    Εμφανίζει ένα «σκελετικό» (skeleton) placeholder με shimmer animation
+    όσο περιμένουμε την απάντηση του Gemini — πιο επαγγελματική εμπειρία
+    από ένα απλό κείμενο φόρτωσης.
+    """
+    st.markdown('<div class="skeleton skeleton-title"></div>', unsafe_allow_html=True)
+
+    m1, m2, m3 = st.columns(3)
+    for col in (m1, m2, m3):
+        with col:
+            st.markdown('<div class="skeleton skeleton-metric"></div>', unsafe_allow_html=True)
+
+    pill_skeletons = "".join('<span class="skeleton skeleton-pill"></span>' for _ in range(5))
+    st.markdown(
+        f'<div class="wine-card"><div class="pill-row">{pill_skeletons}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    for _ in range(2):
+        st.markdown('<div class="skeleton skeleton-card"></div>', unsafe_allow_html=True)
+
+
+def render_analysis(analysis: WineAnalysis) -> None:
+    # --- Title ---
+    st.markdown(
+        f"""
+        <div class="wine-card" style="margin-bottom: 0.8rem;">
+            <div class="wine-title">{analysis.requested_wine}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Βασικά στοιχεία: Τύπος / Ποικιλία / Περιοχή (st.metric, γρήγορη ματιά) ---
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🍷 Τύπος", analysis.wine_type)
+    m2.metric("🍇 Ποικιλία", analysis.variety)
+    m3.metric("🌍 Περιοχή", analysis.origin)
+
+    # --- Χαρακτηριστικά (pills) ---
+    char_pills = "".join(
+        f'<span class="pill pill-taste">{c}</span>' for c in analysis.characteristics
+    )
+    st.markdown(
+        f"""
+        <div class="wine-card">
+            <h3>👅 Γευστικά Χαρακτηριστικά</h3>
+            <div class="pill-row">{char_pills}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Ταίριασμα με φαγητό (pills) ---
+    pairing_pills = "".join(
+        f'<span class="pill">🍽️ {p}</span>' for p in analysis.food_pairing
+    )
+    st.markdown(
+        f"""
+        <div class="wine-card">
+            <h3>🍽️ Ταίριασμα με Φαγητό</h3>
+            <div class="pill-row">{pairing_pills}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Εναλλακτικές προτάσεις: ξεχωριστή κάρτα ανά πρόταση ---
+    st.markdown("#### 💡 Εναλλακτικές Προτάσεις")
+    for rec in analysis.recommendations:
+        st.markdown(
+            f"""
+            <div class="rec-card">
+                <div class="rec-name">🔄 {rec.name}</div>
+                <span class="rec-profile-pill">{rec.profile}</span>
+                <div class="rec-why-box">
+                    <span class="rec-why-label">🔑 Γιατί προτείνεται</span>
+                    <span class="rec-why-text">{rec.reasoning}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+result_area = st.empty()
+
+search_failed = False
+
+if search_clicked:
+    if not wine_name_input.strip():
+        st.warning("Παρακαλώ γράψε το όνομα ενός κρασιού για αναζήτηση.")
+    else:
+        with result_area.container():
+            render_skeleton()
+        try:
+            result = get_wine_analysis(
+                wine_name_input.strip(),
+                wine_list=store_wine_list or None,
+            )
+            st.session_state["last_analysis"] = result
+        except RuntimeError as e:
+            # Κυρίως: λείπει το API key
+            search_failed = True
+            with result_area.container():
+                st.error(f"⚠️ {e}")
+        except APIError as e:
+            # Σφάλματα από το ίδιο το Gemini API (auth, quota, μοντέλο κ.λπ.)
+            search_failed = True
+            with result_area.container():
+                st.error(f"⚠️ Σφάλμα κατά την κλήση στο Gemini API: {e}")
+        except ValueError as e:
+            # Πρόβλημα στο parsing/validation του JSON response
+            search_failed = True
+            with result_area.container():
+                st.error(f"⚠️ Το αποτέλεσμα δεν ήταν έγκυρο: {e}")
+        except Exception as e:
+            # Γενικό δίχτυ ασφαλείας για οτιδήποτε απρόβλεπτο
+            search_failed = True
+            with result_area.container():
+                st.error(f"⚠️ Απρόσμενο σφάλμα: {e}")
+
+# Εμφάνιση αποτελέσματος: είτε μετά από νέα επιτυχή αναζήτηση, είτε
+# διατηρώντας το προηγούμενο αποτέλεσμα σε ένα απλό rerun χωρίς νέο κλικ.
+if not search_failed and "last_analysis" in st.session_state and (
+    not search_clicked or wine_name_input.strip()
+):
+    with result_area.container():
+        render_analysis(st.session_state["last_analysis"])
+
+if "last_analysis" not in st.session_state:
+    st.markdown(
+        """
+        <div style="text-align:center; color:var(--wine-text-dim); margin-top:2rem; font-size:0.9rem;">
+            Πληκτρολόγησε το όνομα ενός κρασιού παραπάνω και πάτησε "Αναζήτηση"
+            για να πάρεις μια ανάλυση από τον AI Sommelier (Gemini).
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
